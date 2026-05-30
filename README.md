@@ -16,6 +16,16 @@ A small cross-platform Electron app for Windows, Linux, and macOS that:
 
 ![App Screenshot](RWCScreenshot.png)
 
+### Mac Installation Note
+
+If you see **"Reddit Wallpaper Changer is damaged and can't be opened"** when launching on Mac, this is due to Apple's Gatekeeper blocking unsigned apps. To fix it, open **Terminal** and run:
+
+```
+xattr -cr /Applications/Reddit\ Wallpaper\ Changer.app
+```
+
+Then try opening the app again. Alternatively go to **System Settings → Privacy & Security** and click **Open Anyway** if the option appears there.
+
 ## Platform support
 
 Wallpaper changing is supported on:
@@ -29,25 +39,6 @@ Startup behavior is also platform-aware:
 - Windows and macOS use Electron login item settings with the `--hidden` launch argument.
 - Linux writes a freedesktop autostart entry to `~/.config/autostart/reddit-wallpaper-changer.desktop` with the `--hidden` launch argument.
 - Launches with `--hidden`, `--startup`, or OS login-item startup stay hidden in the tray/menu bar until you choose **Show Reddit Wallpaper Changer**.
-
-## Build packages
-
-Install dependencies first:
-
-```bash
-npm install
-```
-
-Build packages for the current platform or specific targets:
-
-```bash
-npm run dist
-npm run dist:win
-npm run dist:linux
-npm run dist:mac
-```
-
-Linux builds produce AppImage, Debian (`.deb`), and Arch Linux (`.pacman`) packages. macOS builds produce DMG and ZIP packages. Windows builds produce an NSIS installer.
 
 ## Notes
 
