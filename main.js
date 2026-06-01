@@ -8,7 +8,7 @@ const { pathToFileURL } = require('url');
 const REDDIT_BASE_URL = 'https://www.reddit.com/r/wallpaper';
 const USER_AGENT = [
   'Mozilla/5.0',
-  '(compatible; RedditWallpaperChanger/1.0.7; +https://github.com/reddit-wallpaper-changer/reddit-wallpaper-changer)'
+  '(compatible; RedditWallpaperChanger/1.0.8; +https://github.com/reddit-wallpaper-changer/reddit-wallpaper-changer)'
 ].join(' ');
 const REDDIT_SORT_OPTIONS = new Set(['best', 'hot', 'new', 'top', 'rising']);
 const RESOLUTION_OPTIONS = new Set([
@@ -491,27 +491,132 @@ function parseRedditFeed(xml) {
   }).filter(Boolean);
 }
 
-function firstGalleryImage(post) {
+function isLikelySizedPreviewUrl(url) {
+  try {
+    const parsed = new URL(normalizeCandidateImageUrl(url));
+    return parsed.hostname.toLowerCase() === 'preview.redd.it'
+      && (parsed.searchParams.has('width') || parsed.searchParams.has('height') || parsed.searchParams.has('crop'));
+  } catch {
+    return false;
+  }
+}
+
+function redditOriginalUrlFromPreview(url) {
+  try {
+    const parsed = new URL(normalizeCandidateImageUrl(url));
+    if (parsed.hostname.toLowerCase() !== 'preview.redd.it') return '';
+    const filename = path.basename(parsed.pathname);
+    if (!filename || !imageExtensionFromUrl(`https://i.redd.it/${filename}`)) return '';
+    return `https://i.redd.it/${filename}`;
+  } catch {
+    return '';
+  }
+}
+
+function imageUrlHostScore(url) {
+  try {
+    const host = new URL(normalizeCandidateImageUrl(url)).hostname.toLowerCase();
+    if (host === 'i.redd.it') return 1_000_000_000;
+    if (host === 'i.imgur.com') return 850_000_000;
+    if (host === 'preview.redd.it') return 350_000_000;
+    if (host === 'external-preview.redd.it') return 150_000_000;
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
+function imageCandidateScore(candidate) {
+  const area = Number(candidate.width || 0) * Number(candidate.height || 0);
+  const sourceScores = {
+    redditOriginalFromPreview: 900_000_000,
+    gallerySource: 650_000_000,
+    direct: 600_000_000,
+    previewSource: 500_000_000,
+    galleryPreview: 150_000_000,
+    feed: 100_000_000
+  };
+  const sizedPreviewPenalty = isLikelySizedPreviewUrl(candidate.url) ? 500_000_000 : 0;
+  return imageUrlHostScore(candidate.url) + (sourceScores[candidate.source] || 0) + area - sizedPreviewPenalty;
+}
+
+function addImageCandidate(candidates, candidate) {
+  const url = normalizeCandidateImageUrl(candidate.url);
+  if (!url || !isLikelyImageUrl(url)) return;
+  if (candidates.some((item) => item.url === url)) return;
+
+  candidates.push({
+    ...candidate,
+    url,
+    width: Number(candidate.width || 0),
+    height: Number(candidate.height || 0)
+  });
+
+  const originalUrl = redditOriginalUrlFromPreview(url);
+  if (originalUrl && !candidates.some((item) => item.url === originalUrl)) {
+    candidates.push({
+      ...candidate,
+      url: originalUrl,
+      source: 'redditOriginalFromPreview',
+      width: Number(candidate.width || 0),
+      height: Number(candidate.height || 0)
+    });
+  }
+}
+
+function firstGalleryMedia(post) {
   if (!post.gallery_data || !post.media_metadata) return null;
   const item = post.gallery_data.items?.[0];
   if (!item) return null;
   const media = post.media_metadata[item.media_id];
   if (!media || media.status !== 'valid') return null;
-  const source = media.s || media.p?.at(-1);
-  return source?.u ? htmlDecode(source.u) : null;
+  return media;
 }
 
-function postImageUrl(post) {
-  const directUrl = normalizeCandidateImageUrl(post.url_overridden_by_dest || post.url);
-  if (directUrl && isLikelyImageUrl(directUrl)) return directUrl;
+function collectImageCandidates(post) {
+  const candidates = [];
+  const directUrl = post.url_overridden_by_dest || post.url;
+  addImageCandidate(candidates, { url: directUrl, source: 'direct' });
 
-  const galleryUrl = firstGalleryImage(post);
-  if (galleryUrl) return galleryUrl;
+  const galleryMedia = firstGalleryMedia(post);
+  if (galleryMedia?.s?.u) {
+    addImageCandidate(candidates, {
+      url: galleryMedia.s.u,
+      source: 'gallerySource',
+      width: galleryMedia.s.x,
+      height: galleryMedia.s.y
+    });
+  }
 
-  const preview = post.preview?.images?.[0]?.source?.url;
-  if (preview) return htmlDecode(preview);
+  for (const preview of galleryMedia?.p || []) {
+    addImageCandidate(candidates, {
+      url: preview.u,
+      source: 'galleryPreview',
+      width: preview.x,
+      height: preview.y
+    });
+  }
 
-  return null;
+  const previewSource = post.preview?.images?.[0]?.source;
+  if (previewSource?.url) {
+    addImageCandidate(candidates, {
+      url: previewSource.url,
+      source: 'previewSource',
+      width: previewSource.width,
+      height: previewSource.height
+    });
+  }
+
+  for (const preview of post.preview?.images?.[0]?.resolutions || []) {
+    addImageCandidate(candidates, {
+      url: preview.url,
+      source: 'galleryPreview',
+      width: preview.width,
+      height: preview.height
+    });
+  }
+
+  return candidates.sort((left, right) => imageCandidateScore(right) - imageCandidateScore(left));
 }
 
 function redditPermalink(post) {
@@ -523,9 +628,14 @@ function redditPermalink(post) {
 }
 
 function toWallpaper(post) {
-  const imageUrl = postImageUrl(post);
-  if (!imageUrl) return null;
-  const source = post.preview?.images?.[0]?.source;
+  const candidates = collectImageCandidates(post);
+  const primaryCandidate = candidates[0];
+  if (!primaryCandidate) return null;
+  const dimensionCandidate = candidates
+    .filter((candidate) => candidate.width && candidate.height)
+    .sort((left, right) => (right.width * right.height) - (left.width * left.height))[0];
+  const width = dimensionCandidate?.width || primaryCandidate.width || 0;
+  const height = dimensionCandidate?.height || primaryCandidate.height || 0;
 
   return {
     id: post.id,
@@ -533,12 +643,13 @@ function toWallpaper(post) {
     author: post.author || 'unknown',
     permalink: redditPermalink(post),
     createdUtc: post.created_utc,
-    imageUrl,
+    imageUrl: primaryCandidate.url,
+    imageUrls: candidates.map((candidate) => candidate.url),
     cachedPath: '',
     score: post.score || 0,
-    width: source?.width || 0,
-    height: source?.height || 0,
-    resolution: source ? `${source.width} x ${source.height}` : ''
+    width,
+    height,
+    resolution: width && height ? `${width} x ${height}` : ''
   };
 }
 
@@ -587,35 +698,53 @@ function extensionFromContentType(contentType) {
   return '.jpg';
 }
 
+async function fetchWallpaperImage(url) {
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept: 'image/png,image/jpeg,image/webp,image/*;q=0.8,*/*;q=0.5'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+
+  return {
+    contentType: response.headers.get('content-type'),
+    rawBuffer: Buffer.from(await response.arrayBuffer())
+  };
+}
+
 async function downloadWallpaper(wallpaper) {
   if (wallpaper.cachedPath && existsSync(wallpaper.cachedPath)) {
     return wallpaper.cachedPath;
   }
 
   await fs.mkdir(cacheDir(), { recursive: true });
-  const response = await fetch(wallpaper.imageUrl, {
-    headers: {
-      'User-Agent': USER_AGENT,
-      Accept: 'image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5'
-    }
-  });
+  const urls = [...new Set([wallpaper.imageUrl, ...(wallpaper.imageUrls || [])].filter(Boolean))];
+  const errors = [];
 
-  if (!response.ok) {
-    throw new Error(`Image download failed with ${response.status} ${response.statusText}`);
+  for (const url of urls) {
+    try {
+      const { contentType, rawBuffer } = await fetchWallpaperImage(url);
+      const image = nativeImage.createFromBuffer(rawBuffer);
+      const originalExt = imageExtensionFromUrl(url) || extensionFromContentType(contentType);
+      const canUseOriginalFormat = originalExt === '.jpg' || originalExt === '.png' || image.isEmpty();
+      const ext = canUseOriginalFormat ? originalExt : '.png';
+      const filePath = path.join(cacheDir(), `${wallpaper.id}-${slugify(wallpaper.title)}${ext}`);
+      const buffer = canUseOriginalFormat ? rawBuffer : image.toPNG();
+      await fs.writeFile(filePath, buffer);
+
+      wallpaper.imageUrl = url;
+      wallpaper.cachedPath = filePath;
+      return filePath;
+    } catch (error) {
+      errors.push(`${url}: ${error.message}`);
+    }
   }
 
-  const contentType = response.headers.get('content-type');
-  const rawBuffer = Buffer.from(await response.arrayBuffer());
-  const image = nativeImage.createFromBuffer(rawBuffer);
-  const ext = image.isEmpty()
-    ? imageExtensionFromUrl(wallpaper.imageUrl) || extensionFromContentType(contentType)
-    : '.png';
-  const filePath = path.join(cacheDir(), `${wallpaper.id}-${slugify(wallpaper.title)}${ext}`);
-  const buffer = image.isEmpty() ? rawBuffer : image.toPNG();
-  await fs.writeFile(filePath, buffer);
-
-  wallpaper.cachedPath = filePath;
-  return filePath;
+  throw new Error(`Image download failed. Tried ${errors.join('; ')}`);
 }
 
 function runCommand(command, args, options = {}) {
