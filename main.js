@@ -6,7 +6,10 @@ const { execFile } = require('child_process');
 const { pathToFileURL } = require('url');
 
 const REDDIT_BASE_URL = 'https://www.reddit.com/r/wallpaper';
-const USER_AGENT = 'RedditWallpaperChanger/1.0 (+https://www.reddit.com/r/wallpaper/)';
+const USER_AGENT = [
+  'Mozilla/5.0',
+  '(compatible; RedditWallpaperChanger/1.0.7; +https://github.com/reddit-wallpaper-changer/reddit-wallpaper-changer)'
+].join(' ');
 const REDDIT_SORT_OPTIONS = new Set(['best', 'hot', 'new', 'top', 'rising']);
 const RESOLUTION_OPTIONS = new Set([
   'any',
@@ -279,19 +282,62 @@ function redditListingUrl() {
   return url.toString();
 }
 
-async function fetchRedditJson() {
+function redditFeedUrl() {
+  const url = new URL(`${REDDIT_BASE_URL}/${settings.redditSort}.rss`);
+  url.searchParams.set('limit', '100');
+  return url.toString();
+}
+
+function redditRequestHeaders(accept) {
+  return {
+    'User-Agent': USER_AGENT,
+    Accept: accept,
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache'
+  };
+}
+
+async function fetchRedditJsonPosts() {
   const response = await fetch(redditListingUrl(), {
-    headers: {
-      'User-Agent': USER_AGENT,
-      Accept: 'application/json'
-    }
+    headers: redditRequestHeaders('application/json')
   });
 
   if (!response.ok) {
     throw new Error(`Reddit returned ${response.status} ${response.statusText}`);
   }
 
-  return response.json();
+  const payload = await response.json();
+  return payload?.data?.children?.map((child) => child.data).filter(Boolean) || [];
+}
+
+async function fetchRedditFeedPosts() {
+  const response = await fetch(redditFeedUrl(), {
+    headers: redditRequestHeaders([
+      'application/atom+xml',
+      'application/rss+xml',
+      'application/xml',
+      'text/xml',
+      '*/*;q=0.8'
+    ].join(','))
+  });
+
+  if (!response.ok) {
+    throw new Error(`Reddit feed returned ${response.status} ${response.statusText}`);
+  }
+
+  return parseRedditFeed(await response.text());
+}
+
+async function fetchRedditPosts() {
+  try {
+    return await fetchRedditJsonPosts();
+  } catch (jsonError) {
+    try {
+      return await fetchRedditFeedPosts();
+    } catch (feedError) {
+      throw new Error(`${jsonError.message}. RSS fallback also failed: ${feedError.message}`);
+    }
+  }
 }
 
 function htmlDecode(value) {
@@ -300,7 +346,9 @@ function htmlDecode(value) {
     .replaceAll('&lt;', '<')
     .replaceAll('&gt;', '>')
     .replaceAll('&quot;', '"')
-    .replaceAll('&#39;', "'");
+    .replaceAll('&#39;', "'")
+    .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCodePoint(Number.parseInt(code, 16)));
 }
 
 function imageExtensionFromUrl(url) {
@@ -311,6 +359,136 @@ function imageExtensionFromUrl(url) {
   } catch {
     return '';
   }
+}
+
+function normalizeCandidateImageUrl(url) {
+  const decodedUrl = htmlDecode(url).trim();
+  const absoluteUrl = decodedUrl.startsWith('//') ? `https:${decodedUrl}` : decodedUrl;
+
+  try {
+    const parsed = new URL(absoluteUrl);
+    if (parsed.hostname.endsWith('reddit.com') && parsed.searchParams.has('url')) {
+      return normalizeCandidateImageUrl(parsed.searchParams.get('url'));
+    }
+  } catch {
+    return absoluteUrl;
+  }
+
+  return absoluteUrl;
+}
+
+function isLikelyImageUrl(url) {
+  try {
+    const parsed = new URL(normalizeCandidateImageUrl(url));
+    const host = parsed.hostname.toLowerCase();
+    return Boolean(imageExtensionFromUrl(parsed.toString()))
+      || host === 'i.redd.it'
+      || host === 'preview.redd.it'
+      || host === 'external-preview.redd.it'
+      || host === 'i.imgur.com';
+  } catch {
+    return false;
+  }
+}
+
+function splitXmlEntries(xml) {
+  return String(xml || '').match(/<entry\b[\s\S]*?<\/entry>/gi) || [];
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractXmlTag(xml, tagName) {
+  const escapedTagName = escapeRegExp(tagName);
+  const pattern = `<${escapedTagName}\\b[^>]*>([\\s\\S]*?)<\\/${escapedTagName}>`;
+  const match = String(xml || '').match(new RegExp(pattern, 'i'));
+  return match ? htmlDecode(match[1].trim()) : '';
+}
+
+function extractXmlAttribute(xml, tagName, attributeName) {
+  const escapedTagName = escapeRegExp(tagName);
+  const escapedAttributeName = escapeRegExp(attributeName);
+  const tagMatch = String(xml || '').match(new RegExp(`<${escapedTagName}\\b[^>]*>`, 'i'));
+  if (!tagMatch) return '';
+  const attrMatch = tagMatch[0].match(new RegExp(`${escapedAttributeName}=["']([^"']+)["']`, 'i'));
+  return attrMatch ? htmlDecode(attrMatch[1]) : '';
+}
+
+function extractFeedImageUrl(entryXml) {
+  const contentHtml = extractXmlTag(entryXml, 'content') || extractXmlTag(entryXml, 'summary');
+  const mediaThumbnail = extractXmlAttribute(entryXml, 'media:thumbnail', 'url');
+  const mediaContent = extractXmlAttribute(entryXml, 'media:content', 'url');
+  const urls = [mediaContent, mediaThumbnail];
+
+  for (const match of contentHtml.matchAll(/(?:href|src)=["']([^"']+)["']/gi)) {
+    urls.push(match[1]);
+  }
+
+  for (const match of contentHtml.matchAll(/(?:https?:)?\/\/[^\s"'<>]+/gi)) {
+    urls.push(match[0]);
+  }
+
+  return urls.map(normalizeCandidateImageUrl).find(isLikelyImageUrl) || null;
+}
+
+function extractFeedPostId(entryXml, permalink) {
+  const id = extractXmlTag(entryXml, 'id');
+  const commentPathMatch = `${permalink} ${id}`.match(/\/comments\/([a-z0-9]+)\b/i);
+  if (commentPathMatch) return commentPathMatch[1];
+
+  const fallbackMatch = id.match(/([a-z0-9]{5,})$/i);
+  return fallbackMatch ? fallbackMatch[1] : Buffer.from(id || permalink).toString('hex').slice(0, 12);
+}
+
+function extractResolutionFromText(value) {
+  const match = String(value || '').match(/(?:^|[^\d])(\d{3,5})\s*[x×]\s*(\d{3,5})(?:[^\d]|$)/i);
+  if (!match) return null;
+
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+  return { width, height };
+}
+
+function parseFeedDate(entryXml) {
+  const dateValue = extractXmlTag(entryXml, 'published')
+    || extractXmlTag(entryXml, 'updated')
+    || extractXmlTag(entryXml, 'pubDate');
+  const milliseconds = Date.parse(dateValue);
+  return Number.isFinite(milliseconds) ? milliseconds / 1000 : 0;
+}
+
+function parseRedditFeed(xml) {
+  return splitXmlEntries(xml).map((entryXml) => {
+    const title = extractXmlTag(entryXml, 'title') || 'Untitled wallpaper';
+    const author = extractXmlTag(extractXmlTag(entryXml, 'author'), 'name') || 'unknown';
+    const permalink = extractXmlAttribute(entryXml, 'link', 'href');
+    const imageUrl = extractFeedImageUrl(entryXml);
+    const resolution = extractResolutionFromText(`${title} ${extractXmlTag(entryXml, 'content')}`);
+
+    if (!imageUrl || !permalink) return null;
+
+    return {
+      id: extractFeedPostId(entryXml, permalink),
+      title,
+      author,
+      permalink,
+      created_utc: parseFeedDate(entryXml),
+      url: imageUrl,
+      url_overridden_by_dest: imageUrl,
+      score: 0,
+      preview: resolution ? {
+        images: [{
+          source: {
+            url: imageUrl,
+            width: resolution.width,
+            height: resolution.height
+          }
+        }]
+      } : null
+    };
+  }).filter(Boolean);
 }
 
 function firstGalleryImage(post) {
@@ -324,8 +502,8 @@ function firstGalleryImage(post) {
 }
 
 function postImageUrl(post) {
-  const directUrl = htmlDecode(post.url_overridden_by_dest || post.url);
-  if (directUrl && imageExtensionFromUrl(directUrl)) return directUrl;
+  const directUrl = normalizeCandidateImageUrl(post.url_overridden_by_dest || post.url);
+  if (directUrl && isLikelyImageUrl(directUrl)) return directUrl;
 
   const galleryUrl = firstGalleryImage(post);
   if (galleryUrl) return galleryUrl;
@@ -334,6 +512,14 @@ function postImageUrl(post) {
   if (preview) return htmlDecode(preview);
 
   return null;
+}
+
+function redditPermalink(post) {
+  if (typeof post.permalink === 'string' && /^https?:\/\//.test(post.permalink)) {
+    return post.permalink;
+  }
+
+  return `https://www.reddit.com${post.permalink}`;
 }
 
 function toWallpaper(post) {
@@ -345,7 +531,7 @@ function toWallpaper(post) {
     id: post.id,
     title: post.title || 'Untitled wallpaper',
     author: post.author || 'unknown',
-    permalink: `https://www.reddit.com${post.permalink}`,
+    permalink: redditPermalink(post),
     createdUtc: post.created_utc,
     imageUrl,
     cachedPath: '',
@@ -359,6 +545,7 @@ function toWallpaper(post) {
 function matchesSelectedResolution(wallpaper) {
   const resolution = selectedResolution();
   if (!resolution || resolution === 'any') return true;
+  if (!wallpaper.width || !wallpaper.height) return true;
   return `${wallpaper.width}x${wallpaper.height}` === resolution;
 }
 
@@ -366,8 +553,7 @@ async function refreshWallpapers({ setNewest = false } = {}) {
   const resolution = selectedResolution();
   const resolutionLabel = resolution === 'any' ? 'any resolution' : resolution.replace('x', ' x ');
   setStatus(`Fetching ${redditSortLabel()} wallpapers from r/wallpaper at ${resolutionLabel}...`, 'loading');
-  const payload = await fetchRedditJson();
-  const posts = payload?.data?.children?.map((child) => child.data).filter(Boolean) || [];
+  const posts = await fetchRedditPosts();
   wallpapers = posts.map(toWallpaper).filter(Boolean).filter(matchesSelectedResolution).slice(0, 10);
 
   if (!wallpapers.length) {
